@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import http.client as http_client
 import ipaddress
 import json
 import logging
@@ -31,10 +32,14 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from http import HTTPStatus
-from http.client import HTTPConnection, HTTPResponse, HTTPSConnection
+from http.client import HTTPResponse
 from http.server import BaseHTTPRequestHandler
 from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit, urlunsplit
+
+
+HTTPConnection = http_client.HTTPConnection
+HTTPSConnection = getattr(http_client, "HTTPSConnection", None)
 
 
 HOP_BY_HOP_HEADERS = {
@@ -355,6 +360,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         conn = None
         upstream_resp: Optional[HTTPResponse] = None
         try:
+            if scheme == "https" and HTTPSConnection is None:
+                self._safe_send_error(
+                    HTTPStatus.BAD_GATEWAY,
+                    "HTTPS upstream is unavailable in this Python runtime (no SSL/HTTPSConnection support).",
+                )
+                return
             conn_cls = HTTPSConnection if scheme == "https" else HTTPConnection
             conn = conn_cls(host, port=port, timeout=self.server.config.io_timeout)
             conn.request(self.command, path, body=req_body, headers=req_headers)

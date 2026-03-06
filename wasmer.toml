@@ -1,11 +1,11 @@
 [package]
 name = "mintiler-dev/proxalogue-proxy"
-version = "0.1.2"
+version = "0.1.4"
 description = "Advanced Python proxy server for Wasmer"
 entrypoint = "start"
 
 [dependencies]
-"wasmer/python" = "^3.12.6"
+"wasmer/python" = "=3.12.10-beta.2"
 
 [fs]
 "/app" = "."
