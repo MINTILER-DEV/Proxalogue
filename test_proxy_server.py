@@ -24,7 +24,7 @@ class CountingOriginHandler(BaseHTTPRequestHandler):
         with cls.lock:
             return cls.hits
 
-    def do_GET(self) -> None:
+    def _write_ok(self, include_body: bool) -> None:
         with self.__class__.lock:
             self.__class__.hits += 1
             hit_number = self.__class__.hits
@@ -35,7 +35,14 @@ class CountingOriginHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "public, max-age=120")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if include_body:
+            self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        self._write_ok(include_body=True)
+
+    def do_HEAD(self) -> None:
+        self._write_ok(include_body=False)
 
     def log_message(self, fmt: str, *args) -> None:
         return
@@ -69,11 +76,12 @@ def stop_server(server_obj, thread: threading.Thread) -> None:
 
 def send_proxy_http_request(
     proxy_port: int,
-    absolute_url: str,
+    url_or_path: str,
     headers: Optional[Dict[str, str]] = None,
+    method: str = "GET",
 ) -> Tuple[int, Dict[str, str], bytes]:
     conn = HTTPConnection("127.0.0.1", proxy_port, timeout=5)
-    conn.request("GET", absolute_url, headers=headers or {})
+    conn.request(method, url_or_path, headers=headers or {})
     resp = conn.getresponse()
     body = resp.read()
     out_headers = {k.lower(): v for k, v in resp.getheaders()}
@@ -130,6 +138,8 @@ class ProxyServerIntegrationTests(unittest.TestCase):
             self.assertEqual(second_status, 200)
             self.assertEqual(first_headers.get("x-proxy-cache"), "MISS")
             self.assertEqual(second_headers.get("x-proxy-cache"), "HIT")
+            self.assertEqual(first_headers.get("access-control-allow-origin"), "*")
+            self.assertEqual(second_headers.get("access-control-allow-origin"), "*")
             self.assertEqual(first_body, second_body)
             self.assertEqual(CountingOriginHandler.get_hits(), 1)
         finally:
@@ -143,8 +153,9 @@ class ProxyServerIntegrationTests(unittest.TestCase):
             url = f"http://127.0.0.1:{self.origin_port}/auth"
             host_header = {"Host": f"127.0.0.1:{self.origin_port}"}
 
-            status, _, _ = send_proxy_http_request(port, url, host_header)
+            status, headers, _ = send_proxy_http_request(port, url, host_header)
             self.assertEqual(status, 407)
+            self.assertEqual(headers.get("access-control-allow-origin"), "*")
 
             token = base64.b64encode(b"alice:secret").decode("ascii")
             auth_headers = dict(host_header)
@@ -183,6 +194,66 @@ class ProxyServerIntegrationTests(unittest.TestCase):
                 sock.sendall(payload)
                 echoed = sock.recv(len(payload))
                 self.assertEqual(echoed, payload)
+        finally:
+            stop_server(proxy, thread)
+
+    def test_local_root_path_does_not_self_proxy(self) -> None:
+        CountingOriginHandler.reset_hits()
+        config = ProxyConfig(cache_enabled=False)
+        proxy, thread, port = self.start_proxy(config)
+        try:
+            status, headers, body = send_proxy_http_request(
+                port,
+                "/",
+                headers={"Host": "proxalogue-proxy.wasmer.app"},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(headers.get("access-control-allow-origin"), "*")
+            self.assertIn(b"Forward proxy is running", body)
+            self.assertEqual(CountingOriginHandler.get_hits(), 0)
+        finally:
+            stop_server(proxy, thread)
+
+    def test_url_prefix_mode_http(self) -> None:
+        CountingOriginHandler.reset_hits()
+        config = ProxyConfig(cache_enabled=False)
+        proxy, thread, port = self.start_proxy(config)
+        try:
+            path_mode_url = f"/http://127.0.0.1:{self.origin_port}/path-mode"
+            status, headers, body = send_proxy_http_request(
+                port,
+                path_mode_url,
+                headers={"Host": "proxalogue-proxy.wasmer.app"},
+                method="HEAD",
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(headers.get("access-control-allow-origin"), "*")
+            self.assertEqual(body, b"")
+
+            status2, _, body2 = send_proxy_http_request(
+                port,
+                path_mode_url,
+                headers={"Host": "proxalogue-proxy.wasmer.app"},
+            )
+            self.assertEqual(status2, 200)
+            self.assertIn(b"origin-hit-", body2)
+        finally:
+            stop_server(proxy, thread)
+
+    def test_query_url_mode_http(self) -> None:
+        CountingOriginHandler.reset_hits()
+        config = ProxyConfig(cache_enabled=False)
+        proxy, thread, port = self.start_proxy(config)
+        try:
+            query_mode_path = f"/proxy?url=http://127.0.0.1:{self.origin_port}/query-mode"
+            status, headers, body = send_proxy_http_request(
+                port,
+                query_mode_path,
+                headers={"Host": "proxalogue-proxy.wasmer.app"},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(headers.get("access-control-allow-origin"), "*")
+            self.assertIn(b"origin-hit-", body)
         finally:
             stop_server(proxy, thread)
 

@@ -1,11 +1,13 @@
-kind: wasmer.io/App.v0
 name: proxalogue-proxy
+app_id: da_R9EIBt1UD5LM
+owner: mintiler-dev
 package: .
-cli_args:
-  - /app/proxy_server.py
-  - --host
-  - 0.0.0.0
-  - --port
-  - "8080"
 env:
   PYTHONEXECUTABLE: /bin/python
+cli_args:
+- /app/proxy_server.py
+- --host
+- 0.0.0.0
+- --port
+- '8080'
+kind: wasmer.io/App.v0

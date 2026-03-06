@@ -1,6 +1,6 @@
 [package]
-name = "local/proxalogue-proxy"
-version = "0.1.0"
+name = "mintiler-dev/proxalogue-proxy"
+version = "0.1.1"
 description = "Advanced Python proxy server for Wasmer"
 entrypoint = "start"
 
@@ -16,11 +16,5 @@ module = "wasmer/python:python"
 runner = "wasi"
 
 [command.annotations.wasi]
-main-args = [
-    "/app/proxy_server.py",
-    "--host",
-    "0.0.0.0",
-    "--port",
-    "8080",
-]
+main-args = ["/app/proxy_server.py", "--host", "0.0.0.0", "--port", "8080"]
 env = ["PYTHONEXECUTABLE=/bin/python"]

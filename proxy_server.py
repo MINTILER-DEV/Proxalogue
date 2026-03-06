@@ -31,10 +31,10 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from http import HTTPStatus
-from http.client import HTTPConnection, HTTPResponse
+from http.client import HTTPConnection, HTTPResponse, HTTPSConnection
 from http.server import BaseHTTPRequestHandler
 from typing import Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 
 HOP_BY_HOP_HEADERS = {
@@ -46,6 +46,14 @@ HOP_BY_HOP_HEADERS = {
     "trailer",
     "transfer-encoding",
     "upgrade",
+}
+
+CORS_OVERRIDE_HEADERS = {
+    "access-control-allow-origin",
+    "access-control-allow-methods",
+    "access-control-allow-headers",
+    "access-control-expose-headers",
+    "access-control-max-age",
 }
 
 
@@ -219,7 +227,14 @@ class ProxyServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 class ProxyRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def end_headers(self) -> None:
+        self._send_cors_headers()
+        super().end_headers()
+
     def do_CONNECT(self) -> None:
+        self._run_request_safely(self._handle_connect_request)
+
+    def _handle_connect_request(self) -> None:
         if not self._preflight():
             return
 
@@ -238,7 +253,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self._tunnel_bidirectional(self.connection, upstream, self.server.config.tunnel_idle_timeout)
         except OSError as exc:
-            self.send_error(HTTPStatus.BAD_GATEWAY, f"CONNECT failed: {exc}")
+            self._safe_send_error(HTTPStatus.BAD_GATEWAY, f"CONNECT failed: {exc}")
         finally:
             if upstream:
                 try:
@@ -247,25 +262,31 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     pass
 
     def do_GET(self) -> None:
-        self._handle_http_request()
+        self._run_request_safely(self._handle_http_request)
 
     def do_POST(self) -> None:
-        self._handle_http_request()
+        self._run_request_safely(self._handle_http_request)
 
     def do_PUT(self) -> None:
-        self._handle_http_request()
+        self._run_request_safely(self._handle_http_request)
 
     def do_PATCH(self) -> None:
-        self._handle_http_request()
+        self._run_request_safely(self._handle_http_request)
 
     def do_DELETE(self) -> None:
-        self._handle_http_request()
+        self._run_request_safely(self._handle_http_request)
 
     def do_HEAD(self) -> None:
-        self._handle_http_request()
+        self._run_request_safely(self._handle_http_request)
 
     def do_OPTIONS(self) -> None:
-        self._handle_http_request()
+        self._run_request_safely(self._handle_http_request)
+
+    def _run_request_safely(self, fn) -> None:  # type: ignore[no-untyped-def]
+        try:
+            fn()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError) as exc:
+            logging.debug("client_disconnect client=%s path=%s err=%r", self.client_address[0], self.path, exc)
 
     def _preflight(self) -> bool:
         client_ip = self.client_address[0]
@@ -301,6 +322,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             return
         request_start = now_monotonic()
 
+        if self._handle_local_non_proxy_path():
+            return
+
         target = self._resolve_http_target()
         if not target:
             self.send_error(HTTPStatus.BAD_REQUEST, "Target URL/Host is invalid")
@@ -309,9 +333,6 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
         if scheme not in {"http", "https"}:
             self.send_error(HTTPStatus.BAD_REQUEST, "Unsupported URL scheme")
-            return
-        if scheme == "https":
-            self.send_error(HTTPStatus.BAD_REQUEST, "Use CONNECT for HTTPS proxying")
             return
         if not self.server.acl.is_allowed(host):
             self.send_error(HTTPStatus.FORBIDDEN, "Target blocked by ACL")
@@ -334,7 +355,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         conn = None
         upstream_resp: Optional[HTTPResponse] = None
         try:
-            conn = HTTPConnection(host, port=port, timeout=self.server.config.io_timeout)
+            conn_cls = HTTPSConnection if scheme == "https" else HTTPConnection
+            conn = conn_cls(host, port=port, timeout=self.server.config.io_timeout)
             conn.request(self.command, path, body=req_body, headers=req_headers)
             upstream_resp = conn.getresponse()
             status = upstream_resp.status
@@ -383,9 +405,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
             self._log_request(host, port, reason, status, request_start, cache="MISS")
         except TimeoutError:
-            self.send_error(HTTPStatus.GATEWAY_TIMEOUT, "Upstream timed out")
+            self._safe_send_error(HTTPStatus.GATEWAY_TIMEOUT, "Upstream timed out")
         except OSError as exc:
-            self.send_error(HTTPStatus.BAD_GATEWAY, f"Upstream error: {exc}")
+            self._safe_send_error(HTTPStatus.BAD_GATEWAY, f"Upstream error: {exc}")
         finally:
             if upstream_resp:
                 try:
@@ -395,17 +417,76 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             if conn:
                 conn.close()
 
-    def _resolve_http_target(self) -> Optional[Tuple[str, str, int, str, str]]:
+    def _handle_local_non_proxy_path(self) -> bool:
         raw = self.path.strip()
         if raw.startswith("http://") or raw.startswith("https://"):
+            return False
+        if raw.startswith("/http://") or raw.startswith("/https://"):
+            return False
+        if raw.startswith("/proxy?") or raw.startswith("/proxy/?"):
             parts = urlsplit(raw)
+            url_values = parse_qs(parts.query).get("url", [])
+            if url_values and (url_values[0].startswith("http://") or url_values[0].startswith("https://")):
+                return False
+
+        if raw in {"/", "/health", "/healthz"}:
+            body = (
+                b"Forward proxy is running.\n"
+                b"Use a proxy-aware client, or URL-prefix mode: /https://example.com/file.js\n"
+            )
+            self.send_response(HTTPStatus.OK, "OK")
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+                self.wfile.flush()
+            return True
+
+        if raw == "/favicon.ico":
+            self.send_response(HTTPStatus.NO_CONTENT, "No Content")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return True
+
+        self.send_error(
+            HTTPStatus.BAD_REQUEST,
+            "Forward proxy expects an absolute URL in the request line (e.g. GET http://example.com/).",
+        )
+        return True
+
+    def _safe_send_error(self, status: HTTPStatus, message: str) -> None:
+        try:
+            self.send_error(status, message)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            logging.debug(
+                "send_error_failed client=%s path=%s status=%s",
+                self.client_address[0],
+                self.path,
+                int(status),
+            )
+
+    def _resolve_http_target(self) -> Optional[Tuple[str, str, int, str, str]]:
+        raw = self.path.strip()
+        absolute: Optional[str] = None
+        if raw.startswith("http://") or raw.startswith("https://"):
+            absolute = raw
+        elif raw.startswith("/http://") or raw.startswith("/https://"):
+            absolute = raw[1:]
+        elif raw.startswith("/proxy?") or raw.startswith("/proxy/?"):
+            parts = urlsplit(raw)
+            url_values = parse_qs(parts.query).get("url", [])
+            if url_values:
+                absolute = url_values[0]
+
+        if absolute and (absolute.startswith("http://") or absolute.startswith("https://")):
+            parts = urlsplit(absolute)
             if not parts.hostname:
                 return None
             scheme = (parts.scheme or "http").lower()
             host = parts.hostname
             port = parts.port or (443 if scheme == "https" else 80)
             path = urlunsplit(("", "", parts.path or "/", parts.query or "", ""))
-            absolute = raw
             return scheme, host, port, path, absolute
 
         host_header = self.headers.get("Host")
@@ -500,6 +581,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             lk = k.lower()
             if lk in HOP_BY_HOP_HEADERS:
                 continue
+            if lk in CORS_OVERRIDE_HEADERS:
+                continue
             if lk == "proxy-connection":
                 continue
             if lk == "content-length":
@@ -508,6 +591,13 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         if not has_length:
             out.append(("Connection", "close"))
         return out
+
+    def _send_cors_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, CONNECT")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Expose-Headers", "*")
+        self.send_header("Access-Control-Max-Age", "86400")
 
     def _parse_connect_target(self, target: str) -> Tuple[Optional[str], int]:
         host, port = self._split_host_port(target, default_port=443)
