@@ -39,9 +39,23 @@ class CountingOriginHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def do_GET(self) -> None:
+        if self.path == "/redirect-abs":
+            port = self.server.server_address[1]
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{port}/final-target")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self._write_ok(include_body=True)
 
     def do_HEAD(self) -> None:
+        if self.path == "/redirect-abs":
+            port = self.server.server_address[1]
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{port}/final-target")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self._write_ok(include_body=False)
 
     def log_message(self, fmt: str, *args) -> None:
@@ -254,6 +268,25 @@ class ProxyServerIntegrationTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(headers.get("access-control-allow-origin"), "*")
             self.assertIn(b"origin-hit-", body)
+        finally:
+            stop_server(proxy, thread)
+
+    def test_url_prefix_mode_rewrites_redirect_location(self) -> None:
+        config = ProxyConfig(cache_enabled=False)
+        proxy, thread, port = self.start_proxy(config)
+        try:
+            path_mode_url = f"/http://127.0.0.1:{self.origin_port}/redirect-abs"
+            status, headers, _ = send_proxy_http_request(
+                port,
+                path_mode_url,
+                headers={"Host": "proxalogue-proxy.wasmer.app"},
+                method="HEAD",
+            )
+            self.assertEqual(status, 302)
+            self.assertEqual(
+                headers.get("location"),
+                f"/http://127.0.0.1:{self.origin_port}/final-target",
+            )
         finally:
             stop_server(proxy, thread)
 

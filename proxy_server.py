@@ -35,7 +35,7 @@ from http import HTTPStatus
 from http.client import HTTPResponse
 from http.server import BaseHTTPRequestHandler
 from typing import Dict, Iterable, List, Optional, Tuple
-from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 
 
 HTTPConnection = http_client.HTTPConnection
@@ -373,6 +373,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             status = upstream_resp.status
             reason = upstream_resp.reason or HTTPStatus(status).phrase
             resp_headers = self._filter_response_headers(upstream_resp.getheaders())
+            if self._is_url_prefix_mode():
+                resp_headers = self._rewrite_location_headers(resp_headers, scheme, host, port, path)
 
             body_chunks: List[bytes] = []
             content_length = 0
@@ -509,6 +511,52 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         path = raw if raw.startswith("/") else "/" + raw
         absolute = f"http://{host}:{port}{path}"
         return "http", host, port, path, absolute
+
+    def _is_url_prefix_mode(self) -> bool:
+        raw = self.path.strip()
+        if raw.startswith("/http://") or raw.startswith("/https://"):
+            return True
+        if raw.startswith("/proxy?") or raw.startswith("/proxy/?"):
+            parts = urlsplit(raw)
+            values = parse_qs(parts.query).get("url", [])
+            if values and (values[0].startswith("http://") or values[0].startswith("https://")):
+                return True
+        return False
+
+    def _rewrite_location_headers(
+        self,
+        headers: List[Tuple[str, str]],
+        scheme: str,
+        host: str,
+        port: int,
+        upstream_path: str,
+    ) -> List[Tuple[str, str]]:
+        out: List[Tuple[str, str]] = []
+        for k, v in headers:
+            if k.lower() == "location":
+                out.append((k, self._rewrite_location_value(v, scheme, host, port, upstream_path)))
+            else:
+                out.append((k, v))
+        return out
+
+    def _rewrite_location_value(self, location: str, scheme: str, host: str, port: int, upstream_path: str) -> str:
+        raw = location.strip()
+        if not raw:
+            return location
+
+        if raw.startswith("http://") or raw.startswith("https://"):
+            return "/" + raw
+
+        if raw.startswith("//"):
+            return f"/{scheme}:{raw}"
+
+        default_port = 443 if scheme == "https" else 80
+        hostport = host if port == default_port else f"{host}:{port}"
+        base = f"{scheme}://{hostport}{upstream_path}"
+        resolved = urljoin(base, raw)
+        if resolved.startswith("http://") or resolved.startswith("https://"):
+            return "/" + resolved
+        return raw
 
     def _read_request_body(self) -> Optional[bytes]:
         content_length = self.headers.get("Content-Length")
