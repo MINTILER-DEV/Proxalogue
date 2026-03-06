@@ -11,7 +11,7 @@ Features:
 - Structured request logging
 
 Example:
-    python proxy_server.py --host 0.0.0.0 --port 8080 --auth-user user --auth-pass pass
+    python proxy_server.py --host 0.0.0.0 --port 8080
 """
 
 from __future__ import annotations

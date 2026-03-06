@@ -1,0 +1,26 @@
+[package]
+name = "local/proxalogue-proxy"
+version = "0.1.0"
+description = "Advanced Python proxy server for Wasmer"
+entrypoint = "start"
+
+[dependencies]
+"wasmer/python" = "^3.12.6"
+
+[fs]
+"/app" = "."
+
+[[command]]
+name = "start"
+module = "wasmer/python:python"
+runner = "wasi"
+
+[command.annotations.wasi]
+main-args = [
+    "/app/proxy_server.py",
+    "--host",
+    "0.0.0.0",
+    "--port",
+    "8080",
+]
+env = ["PYTHONEXECUTABLE=/bin/python"]
